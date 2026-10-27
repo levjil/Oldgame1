@@ -19,24 +19,72 @@ jobs:
           cat > patch.py <<'EOF'
           import re, sys, pathlib
           d = pathlib.Path(sys.argv[1])
-          p = d / 'apktool.yml'
-          s = p.read_text(encoding='utf-8')
-          if 'sdkInfo:' not in s:
-              s += "\nsdkInfo:\n  minSdkVersion: '21'\n  targetSdkVersion: '28'\n"
+          mode = sys.argv[2]
+          if mode == 'sdk':
+              p = d / 'apktool.yml'
+              s = p.read_text(encoding='utf-8')
+              if 'sdkInfo:' not in s:
+                  s += "\nsdkInfo:\n  minSdkVersion: '21'\n  targetSdkVersion: '28'\n"
+              else:
+                  if re.search(r'minSdkVersion:', s):
+                      s = re.sub(r"minSdkVersion:.*", "minSdkVersion: '21'", s)
+                  else:
+                      s = s.replace('sdkInfo:', "sdkInfo:\n  minSdkVersion: '21'", 1)
+                  if re.search(r'targetSdkVersion:', s):
+                      s = re.sub(r"targetSdkVersion:.*", "targetSdkVersion: '28'", s)
+                  else:
+                      s = s.replace('sdkInfo:', "sdkInfo:\n  targetSdkVersion: '28'", 1)
+              p.write_text(s, encoding='utf-8')
+              m = d / 'AndroidManifest.xml'
+              x = m.read_text(encoding='utf-8')
+              x = x.replace('android:anyDensity="false"', 'android:anyDensity="true"')
+              x = re.sub(r'android:(smallScreens|normalScreens|largeScreens|xlargeScreens)="false"', r'android:\1="true"', x)
+              if '<supports-screens' in x and 'xlargeScreens' not in x:
+                  x = x.replace('<supports-screens', '<supports-screens android:xlargeScreens="true"', 1)
+              m.write_text(x, encoding='utf-8')
           else:
-              if re.search(r'minSdkVersion:', s):
-                  s = re.sub(r"minSdkVersion:.*", "minSdkVersion: '21'", s)
+              m = d / 'AndroidManifest.xml'
+              x = m.read_text(encoding='utf-8')
+              pkg = re.search(r'package="([^"]+)"', x).group(1)
+              app = re.search(r'<application\b[^>]*>', x).group(0)
+              nm = re.search(r'android:name="([^"]+)"', app)
+              if nm:
+                  name = nm.group(1)
+                  if name.startswith('.'):
+                      name = pkg + name
+                  elif '.' not in name:
+                      name = pkg + '.' + name
+                  sup = 'L' + name.replace('.', '/') + ';'
+                  newapp = app.replace(nm.group(0), 'android:name="strictfix.Fix"', 1)
               else:
-                  s = s.replace('sdkInfo:', "sdkInfo:\n  minSdkVersion: '21'", 1)
-              if re.search(r'targetSdkVersion:', s):
-                  s = re.sub(r"targetSdkVersion:.*", "targetSdkVersion: '28'", s)
-              else:
-                  s = s.replace('sdkInfo:', "sdkInfo:\n  targetSdkVersion: '28'", 1)
-          p.write_text(s, encoding='utf-8')
-          m = d / 'AndroidManifest.xml'
-          x = m.read_text(encoding='utf-8')
-          x = x.replace('android:anyDensity="false"', 'android:anyDensity="true"')
-          m.write_text(x, encoding='utf-8')
+                  sup = 'Landroid/app/Application;'
+                  newapp = app.replace('<application', '<application android:name="strictfix.Fix"', 1)
+              x = x.replace(app, newapp, 1)
+              m.write_text(x, encoding='utf-8')
+              out = d / 'smali' / 'strictfix'
+              out.mkdir(parents=True, exist_ok=True)
+              (out / 'Fix.smali').write_text(f""".class public Lstrictfix/Fix;
+          .super {sup}
+
+          .method public constructor <init>()V
+              .locals 0
+              invoke-direct {{p0}}, {sup}-><init>()V
+              return-void
+          .end method
+
+          .method public onCreate()V
+              .locals 2
+              new-instance v0, Landroid/os/StrictMode$ThreadPolicy$Builder;
+              invoke-direct {{v0}}, Landroid/os/StrictMode$ThreadPolicy$Builder;-><init>()V
+              invoke-virtual {{v0}}, Landroid/os/StrictMode$ThreadPolicy$Builder;->permitAll()Landroid/os/StrictMode$ThreadPolicy$Builder;
+              move-result-object v0
+              invoke-virtual {{v0}}, Landroid/os/StrictMode$ThreadPolicy$Builder;->build()Landroid/os/StrictMode$ThreadPolicy;
+              move-result-object v0
+              invoke-static {{v0}}, Landroid/os/StrictMode;->setThreadPolicy(Landroid/os/StrictMode$ThreadPolicy;)V
+              invoke-super {{p0}}, {sup}->onCreate()V
+              return-void
+          .end method
+          """, encoding='utf-8')
           EOF
 
       - name: Build all APKs
@@ -46,17 +94,24 @@ jobs:
           keytool -genkeypair -keystore my.jks -storepass android -keypass android \
             -alias key -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Local"
           mkdir -p out
+          buildsign() {
+            java -jar apktool.jar b "$1" -o "u_$2.apk" || { echo "BUILD FAILED: $2"; return; }
+            $BT/zipalign -f -p 4 "u_$2.apk" "a_$2.apk"
+            $BT/apksigner sign --ks my.jks --ks-pass pass:android --key-pass pass:android \
+              --out "out/$2.apk" "a_$2.apk"
+            echo "OK: $2"
+          }
           for f in *.apk; do
             n=$(basename "$f" .apk)
+            case "$n" in u_*|a_*) continue;; esac
             echo "=== $n"
-            rm -rf "work_$n"
+            rm -rf "work_$n" "workS_$n"
             java -jar apktool.jar d -f "$f" -o "work_$n" || { echo "DECODE FAILED: $n"; continue; }
-            python3 patch.py "work_$n"
-            java -jar apktool.jar b "work_$n" -o "u_$n.apk" || { echo "BUILD FAILED: $n"; continue; }
-            $BT/zipalign -f -p 4 "u_$n.apk" "a_$n.apk"
-            $BT/apksigner sign --ks my.jks --ks-pass pass:android --key-pass pass:android \
-              --out "out/${n}_fixed.apk" "a_$n.apk"
-            echo "OK: $n"
+            python3 patch.py "work_$n" sdk
+            cp -r "work_$n" "workS_$n"
+            python3 patch.py "workS_$n" strict || echo "STRICT PATCH FAILED: $n"
+            buildsign "work_$n" "${n}_fixed"
+            buildsign "workS_$n" "${n}_strict"
           done
           ls -la out
 
