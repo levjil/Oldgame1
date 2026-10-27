@@ -1,9 +1,7 @@
-name: Rebuild APK for Android 16
+name: Rebuild APKs for Android 16
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main, master]
 
 jobs:
   build:
@@ -16,19 +14,13 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Download apktool
+      - name: Write patch script
         run: |
-          curl -L -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
-
-      - name: Decode original APK
-        run: java -jar apktool.jar d -f game.apk -o decoded
-
-      - name: Patch SDK versions
-        run: |
-          python3 - <<'EOF'
-          import re
-          p = 'decoded/apktool.yml'
-          s = open(p, encoding='utf-8').read()
+          cat > patch.py <<'EOF'
+          import re, sys, pathlib
+          d = pathlib.Path(sys.argv[1])
+          p = d / 'apktool.yml'
+          s = p.read_text(encoding='utf-8')
           if 'sdkInfo:' not in s:
               s += "\nsdkInfo:\n  minSdkVersion: '21'\n  targetSdkVersion: '28'\n"
           else:
@@ -40,24 +32,35 @@ jobs:
                   s = re.sub(r"targetSdkVersion:.*", "targetSdkVersion: '28'", s)
               else:
                   s = s.replace('sdkInfo:', "sdkInfo:\n  targetSdkVersion: '28'", 1)
-          open(p, 'w', encoding='utf-8').write(s)
-          print(s)
+          p.write_text(s, encoding='utf-8')
+          m = d / 'AndroidManifest.xml'
+          x = m.read_text(encoding='utf-8')
+          x = x.replace('android:anyDensity="false"', 'android:anyDensity="true"')
+          m.write_text(x, encoding='utf-8')
           EOF
 
-      - name: Build APK
-        run: java -jar apktool.jar b decoded -o unsigned.apk
-
-      - name: Align and sign
+      - name: Build all APKs
         run: |
+          curl -L -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
           BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
-          $BT/zipalign -f -p 4 unsigned.apk aligned.apk
           keytool -genkeypair -keystore my.jks -storepass android -keypass android \
             -alias key -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Local"
-          $BT/apksigner sign --ks my.jks --ks-pass pass:android --key-pass pass:android \
-            --out game_fixed.apk aligned.apk
-          $BT/apksigner verify game_fixed.apk
+          mkdir -p out
+          for f in *.apk; do
+            n=$(basename "$f" .apk)
+            echo "=== $n"
+            rm -rf "work_$n"
+            java -jar apktool.jar d -f "$f" -o "work_$n" || { echo "DECODE FAILED: $n"; continue; }
+            python3 patch.py "work_$n"
+            java -jar apktool.jar b "work_$n" -o "u_$n.apk" || { echo "BUILD FAILED: $n"; continue; }
+            $BT/zipalign -f -p 4 "u_$n.apk" "a_$n.apk"
+            $BT/apksigner sign --ks my.jks --ks-pass pass:android --key-pass pass:android \
+              --out "out/${n}_fixed.apk" "a_$n.apk"
+            echo "OK: $n"
+          done
+          ls -la out
 
       - uses: actions/upload-artifact@v4
         with:
-          name: game_fixed
-          path: game_fixed.apk
+          name: fixed_apks
+          path: out/*.apk
