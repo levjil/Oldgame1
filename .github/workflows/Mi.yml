@@ -18,26 +18,94 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release download --pattern 'mi.apk' --clobber
-      - name: Patch and build
+
+      - name: Write patch script
         run: |
-          curl -L -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
-          java -jar apktool.jar d -f mi.apk -o work
-          python3 - <<'EOF'
-          import re, pathlib
-          m = pathlib.Path('work/AndroidManifest.xml')
-          x = m.read_text(encoding='utf-8')
-          x2 = re.sub(r'(<uses-library\s+android:name="micloud-sdk")(\s*/>)', r'\1 android:required="false"\2', x)
-          print("patched" if x2 != x else "NOT PATCHED")
-          m.write_text(x2, encoding='utf-8')
+          cat > patch_mi.py <<'EOF'
+          import struct, zipfile, sys, re
+
+          def rebuild_pool(data, old, new):
+              assert struct.unpack_from('<H', data, 0)[0] == 0x0003
+              off = 8
+              t, hs, sz = struct.unpack_from('<HHI', data, off)
+              assert t == 0x0001 and hs == 28
+              cnt, scnt, flags, sstart, ststart = struct.unpack_from('<IIIII', data, off + 8)
+              assert scnt == 0 and sstart == 28 + cnt * 4
+              utf8 = bool(flags & 0x100)
+              offs = list(struct.unpack_from('<%dI' % cnt, data, off + 28))
+              base = off + sstart
+              end = off + sz
+              blobs = []
+              for i in range(cnt):
+                  a = base + offs[i]
+                  b = base + offs[i + 1] if i + 1 < cnt else end
+                  blobs.append(data[a:b])
+              def decode(blob):
+                  if utf8:
+                      p = 0
+                      l = blob[p]; p += 1
+                      if l & 0x80: p += 1
+                      l = blob[p]; p += 1
+                      if l & 0x80:
+                          l = ((l & 0x7f) << 8) | blob[p]; p += 1
+                      return blob[p:p + l].decode('utf-8', 'replace')
+                  l = struct.unpack_from('<H', blob, 0)[0]
+                  return blob[2:2 + l * 2].decode('utf-16le', 'replace')
+              def encode(s):
+                  if utf8:
+                      b = s.encode('utf-8')
+                      return bytes([len(s)]) + bytes([len(b)]) + b + b'\x00'
+                  return struct.pack('<H', len(s)) + s.encode('utf-16le') + b'\x00\x00'
+              idx = [i for i, b in enumerate(blobs) if decode(b) == old]
+              if not idx:
+                  raise SystemExit('string not found: ' + old)
+              for i in idx:
+                  blobs[i] = encode(new)
+              out = b''
+              new_offs = []
+              for b in blobs:
+                  new_offs.append(len(out))
+                  out += b
+              while len(out) % 4:
+                  out += b'\x00'
+              new_sz = sstart + len(out)
+              hdr = struct.pack('<HHI', 0x0001, 28, new_sz) + struct.pack('<IIIII', cnt, 0, flags, sstart, 0)
+              pool = hdr + struct.pack('<%dI' % cnt, *new_offs) + out
+              res = data[:8] + pool + data[end:]
+              res = res[:4] + struct.pack('<I', len(res)) + res[8:]
+              return res, len(idx)
+
+          def main(src, dst, old, new):
+              zin = zipfile.ZipFile(src)
+              zout = zipfile.ZipFile(dst, 'w')
+              for it in zin.infolist():
+                  n = it.filename
+                  if re.match(r'META-INF/.*(\.SF|\.RSA|\.DSA|\.EC|MANIFEST\.MF)$', n):
+                      continue
+                  data = zin.read(n)
+                  if n == 'AndroidManifest.xml':
+                      data, c = rebuild_pool(data, old, new)
+                      print('patched strings:', c)
+                  zi = zipfile.ZipInfo(n, it.date_time)
+                  zi.external_attr = it.external_attr
+                  zi.compress_type = it.compress_type
+                  zout.writestr(zi, data, compress_type=it.compress_type)
+              zout.close()
+
+          main(*sys.argv[1:5])
           EOF
-          java -jar apktool.jar b work -o unsigned.apk
+
+      - name: Patch, align and sign
+        run: |
+          python3 patch_mi.py mi.apk patched.apk micloud-sdk org.apache.http.legacy
           BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
-          $BT/zipalign -f -p 4 unsigned.apk aligned.apk
+          $BT/zipalign -f -p 4 patched.apk aligned.apk
           keytool -genkeypair -keystore my.jks -storepass android -keypass android \
             -alias key -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Local"
           mkdir -p out
           $BT/apksigner sign --ks my.jks --ks-pass pass:android --key-pass pass:android \
             --out out/MiFileManager_fixed.apk aligned.apk
+          $BT/apksigner verify out/MiFileManager_fixed.apk
 
       - uses: actions/upload-artifact@v4
         with:
