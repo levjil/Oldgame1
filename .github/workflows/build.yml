@@ -9,6 +9,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Download big APKs from Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download --pattern 'Sea.apk' --dir . --clobber || echo "no release assets"
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -75,47 +80,3 @@ jobs:
           .method public onCreate()V
               .locals 2
               new-instance v0, Landroid/os/StrictMode$ThreadPolicy$Builder;
-              invoke-direct {{v0}}, Landroid/os/StrictMode$ThreadPolicy$Builder;-><init>()V
-              invoke-virtual {{v0}}, Landroid/os/StrictMode$ThreadPolicy$Builder;->permitAll()Landroid/os/StrictMode$ThreadPolicy$Builder;
-              move-result-object v0
-              invoke-virtual {{v0}}, Landroid/os/StrictMode$ThreadPolicy$Builder;->build()Landroid/os/StrictMode$ThreadPolicy;
-              move-result-object v0
-              invoke-static {{v0}}, Landroid/os/StrictMode;->setThreadPolicy(Landroid/os/StrictMode$ThreadPolicy;)V
-              invoke-super {{p0}}, {sup}->onCreate()V
-              return-void
-          .end method
-          """, encoding='utf-8')
-          EOF
-
-      - name: Build all APKs
-        run: |
-          curl -L -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
-          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
-          keytool -genkeypair -keystore my.jks -storepass android -keypass android \
-            -alias key -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Local"
-          mkdir -p out
-          buildsign() {
-            java -jar apktool.jar b "$1" -o "u_$2.apk" || { echo "BUILD FAILED: $2"; return; }
-            $BT/zipalign -f -p 4 "u_$2.apk" "a_$2.apk"
-            $BT/apksigner sign --ks my.jks --ks-pass pass:android --key-pass pass:android \
-              --out "out/$2.apk" "a_$2.apk"
-            echo "OK: $2"
-          }
-          for f in *.apk; do
-            n=$(basename "$f" .apk)
-            case "$n" in u_*|a_*) continue;; esac
-            echo "=== $n"
-            rm -rf "work_$n" "workS_$n"
-            java -jar apktool.jar d -f "$f" -o "work_$n" || { echo "DECODE FAILED: $n"; continue; }
-            python3 patch.py "work_$n" sdk
-            cp -r "work_$n" "workS_$n"
-            python3 patch.py "workS_$n" strict || echo "STRICT PATCH FAILED: $n"
-            buildsign "work_$n" "${n}_fixed"
-            buildsign "workS_$n" "${n}_strict"
-          done
-          ls -la out
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: fixed_apks
-          path: out/*.apk
